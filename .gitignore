@@ -1,0 +1,31 @@
+thots
+TODO.md
+
+.cvcs/cache/
+.cvcs/tmp/
+
+*.session.json
+*.trace.log
+
+.env
+.env.local
+.env.*.local
+
+.db_credentials
+
+# Compiled binaries
+/bin/
+cvcs-cli
+cvcs-engine
+
+# Dependency directories
+/vendor/
+
+# Test coverage files
+*.out
+*.prof
+
+.DS_Store
+.idea/
+.ideaz/
+.vscode/

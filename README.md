@@ -99,27 +99,7 @@ cvcs rollback commit def456
 
 ## Architecture
 
-```
-CLI / API
-  commit | branch | replay | diff | merge | rollback
-                      |
-         Cognitive Runtime Engine
-    Load commit → hydrate context → call model → audit result
-                      |
-         ┌────────────┴─────────────────┐
-         │       Postgres Ledger        │
-         │                              │
-         │  [1] repositories            │  namespace / tenant boundary
-         │  [2] content store           │  blobs, commits, trees
-         │  [3] execution ledger        │  decisions, replays
-         │  [4] correction layer        │  human overrides, learning signal
-         │  [5] collaboration layer     │  branches, merge requests
-         └──────────────────────────────┘
-                      |
-         Swappable Model Layer
-    OpenAI | Anthropic | Llama | Local
-```
-
+![Architecture0](./media/architecture0.png)
 Postgres is the ledger. The model is a runtime detail.
 
 ---
@@ -128,11 +108,11 @@ Postgres is the ledger. The model is a runtime detail.
 
 ```
 schema/
-  01_repositories.sql   — namespace, tenant isolation, bootstrap
-  02_content_store.sql  — blobs, commits, trees (the git object model)
-  03_execution.sql      — decisions, replays (runtime events, immutable)
-  04_corrections.sql    — human overrides, the learning signal
-  05_collaboration.sql  — branches, merge requests, approval flow
+  01_repositories.sql   - namespace, tenant isolation, bootstrap
+  02_content_store.sql  - blobs, commits, trees (the git object model)
+  03_execution.sql      - decisions, replays (runtime events, immutable)
+  04_corrections.sql    - human overrides, the learning signal
+  05_collaboration.sql  - branches, merge requests, approval flow
 ```
 
 ## MVP Stack
