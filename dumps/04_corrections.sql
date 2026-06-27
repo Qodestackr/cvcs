@@ -1,183 +1,269 @@
 -- ============================================================
--- The learning signal layer.
---
--- When a human overrides an AI decision:
---
---   AI     -> output A
---   Human  -> output B
---
--- That is not noise. That is institutional knowledge surfacing.
--- Every recurring correction reveals a rule that existed long
--- before anyone bothered to write it down.
---
--- This file captures every correction as an immutable event
--- linked to the exact decision it replaced. The original
--- decision is never touched. Both facts coexist in the ledger
--- permanently.
---
--- Over time the corrections table becomes the organization's
--- real memory: not the process it claimed to follow,
--- but the one it actually did.
--- ============================================================
-
--- ============================================================
 -- CORRECTIONS
 --
--- One row per human override. Append-only forever.
--- The original decision is referenced, never mutated.
+-- One row per human override of a model decision.
 --
--- produced_commit_id is set when a correction was significant
--- enough that the operator committed a new cognitive state in
--- response. This is the loop closing: correction -> new commit
--- -> better decisions -> fewer corrections.
+-- correction_scope narrows what was wrong:
+--   'output'   — full output was wrong
+--   'partial'  — a field or section was wrong
+--   'routing'  — right answer, wrong destination
+--   'policy'   — the rule itself needs updating
 --
--- pattern_key is an optional caller-supplied grouping key.
--- Use it to bucket corrections by type so the runtime can
--- surface recurring patterns. e.g. "sku_resolution_wrong_brand"
+-- reason is optional. Silent corrections (no reason) are often
+-- high signal — the human considered the context obvious.
+--
+-- produced_commit_id closes the loop: correction → new commit
+-- → future decisions informed. Null means not yet acted on.
 -- ============================================================
 
 CREATE TABLE cvcs.corrections (
   id                  uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
-  repository_id       uuid        NOT NULL REFERENCES cvcs.repositories(id),
   decision_id         uuid        NOT NULL REFERENCES cvcs.decisions(id),
+  repository_id       uuid        NOT NULL REFERENCES cvcs.repositories(id),
 
-  -- who corrected it
   corrected_by        text        NOT NULL,
+  correction_scope    text        NOT NULL DEFAULT 'output',
 
-  -- what the AI said vs what the human chose
   original_output     text        NOT NULL,
   corrected_output    text        NOT NULL,
 
-  -- why
   reason              text,
+  internal_note       text,
 
-  -- optional: the correction category for pattern detection
-  -- caller-supplied, free-form but should be consistent
-  -- e.g. "wrong_sku", "wrong_threshold", "missing_context"
-  pattern_key         text,
-
-  -- if this correction led to a new commit, link it
   produced_commit_id  uuid        REFERENCES cvcs.commits(id),
 
   corrected_at        timestamptz NOT NULL DEFAULT now(),
 
+  CHECK (correction_scope IN ('output', 'partial', 'routing', 'policy')),
   CHECK (length(corrected_by) > 0),
-  CHECK (length(original_output) > 0),
-  CHECK (length(corrected_output) > 0),
   CHECK (original_output <> corrected_output)
 );
 
 CREATE INDEX corrections_decision_idx     ON cvcs.corrections (decision_id);
-CREATE INDEX corrections_repository_idx   ON cvcs.corrections (repository_id, corrected_at DESC);
-CREATE INDEX corrections_pattern_idx      ON cvcs.corrections (repository_id, pattern_key, corrected_at DESC) WHERE pattern_key IS NOT NULL;
-CREATE INDEX corrections_commit_idx       ON cvcs.corrections (produced_commit_id) WHERE produced_commit_id IS NOT NULL;
-CREATE INDEX corrections_unclosed_idx     ON cvcs.corrections (repository_id, corrected_at DESC) WHERE produced_commit_id IS NULL;
+CREATE INDEX corrections_repo_idx         ON cvcs.corrections (repository_id, corrected_at DESC);
+CREATE INDEX corrections_actor_idx        ON cvcs.corrections (repository_id, corrected_by, corrected_at DESC);
+CREATE INDEX corrections_scope_idx        ON cvcs.corrections (repository_id, correction_scope, corrected_at DESC);
+CREATE INDEX corrections_open_loop_idx    ON cvcs.corrections (repository_id, corrected_at DESC)
+  WHERE produced_commit_id IS NULL;
 
-COMMENT ON TABLE cvcs.corrections IS
-  'Human overrides of AI decisions. The highest-signal learning event in the system. Append-only. The original decision is never mutated.';
 
-COMMENT ON COLUMN cvcs.corrections.decision_id IS
-  'The exact decision being overridden. Never updated. Both the original decision and this correction coexist permanently.';
+-- ============================================================
+-- CORRECTION PATTERNS
+--
+-- Detected recurrences written by the pattern detection job,
+-- not by humans. Reviewed and ratified by humans.
+--
+-- status lifecycle: detected → reviewed → ratified | dismissed
+--
+-- example_decision_ids: a sample of contributing decisions,
+-- so reviewers can inspect without running a query.
+-- ============================================================
 
-COMMENT ON COLUMN cvcs.corrections.pattern_key IS
-  'Optional caller-supplied grouping key. Use consistently to enable pattern detection across corrections. e.g. wrong_sku, wrong_threshold, missing_context.';
+CREATE TABLE cvcs.correction_patterns (
+  id                    uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+  repository_id         uuid        NOT NULL REFERENCES cvcs.repositories(id),
 
-COMMENT ON COLUMN cvcs.corrections.produced_commit_id IS
-  'Set when this correction was significant enough to produce a new cognitive state. The learning loop made visible: correction -> commit -> fewer corrections.';
+  decision_type         text        NOT NULL,
+  pattern_summary       text        NOT NULL,
+  inferred_rule         text,
 
-COMMENT ON COLUMN cvcs.corrections.original_output IS
-  'Copied from decisions.raw_output at insert time. Preserved here so the correction is self-contained even if query patterns change.';
+  correction_count      integer     NOT NULL,
+  first_seen_at         timestamptz NOT NULL,
+  last_seen_at          timestamptz NOT NULL,
+
+  status                text        NOT NULL DEFAULT 'detected',
+  reviewed_by           text,
+  reviewed_at           timestamptz,
+
+  example_decision_ids  uuid[]      NOT NULL DEFAULT '{}',
+
+  detected_at           timestamptz NOT NULL DEFAULT now(),
+
+  CHECK (status IN ('detected', 'reviewed', 'ratified', 'dismissed')),
+  CHECK (correction_count > 0),
+  CHECK (
+    (status IN ('reviewed', 'ratified', 'dismissed') AND reviewed_by IS NOT NULL)
+    OR status = 'detected'
+  )
+);
+
+CREATE INDEX patterns_repo_status_idx ON cvcs.correction_patterns (repository_id, status, last_seen_at DESC);
+CREATE INDEX patterns_type_idx        ON cvcs.correction_patterns (repository_id, decision_type, last_seen_at DESC);
+CREATE INDEX patterns_active_idx      ON cvcs.correction_patterns (repository_id, last_seen_at DESC)
+  WHERE status IN ('detected', 'reviewed');
+
+
+-- ============================================================
+-- RATIFIED RULES
+--
+-- A correction pattern approved as an explicit organizational rule.
+-- On ratification, a blob is written and committed into the tree —
+-- the model sees it on future runs.
+--
+-- valid_from / valid_until are the temporal validity window.
+-- valid_until = NULL means currently active.
+-- superseded_by links to the rule that replaced this one,
+-- building a temporal chain of how rules evolved.
+-- ============================================================
+
+CREATE TABLE cvcs.ratified_rules (
+  id                  uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+  repository_id       uuid        NOT NULL REFERENCES cvcs.repositories(id),
+  pattern_id          uuid        NOT NULL REFERENCES cvcs.correction_patterns(id),
+
+  rule_text           text        NOT NULL,
+  decision_type       text        NOT NULL,
+
+  blob_hash           text        REFERENCES cvcs.blobs(hash),
+  produced_commit_id  uuid        REFERENCES cvcs.commits(id),
+
+  ratified_by         text        NOT NULL,
+  ratified_at         timestamptz NOT NULL DEFAULT now(),
+
+  valid_from          timestamptz NOT NULL DEFAULT now(),
+  valid_until         timestamptz,
+  superseded_by       uuid        REFERENCES cvcs.ratified_rules(id),
+
+  CHECK (length(rule_text) > 0),
+  CHECK (length(ratified_by) > 0),
+  CHECK (valid_until IS NULL OR valid_until > valid_from)
+);
+
+CREATE INDEX ratified_rules_repo_idx    ON cvcs.ratified_rules (repository_id, valid_from DESC);
+CREATE INDEX ratified_rules_type_idx    ON cvcs.ratified_rules (repository_id, decision_type, valid_from DESC);
+CREATE INDEX ratified_rules_active_idx  ON cvcs.ratified_rules (repository_id, valid_from DESC)
+  WHERE valid_until IS NULL;
+
 
 -- ============================================================
 -- APPEND-ONLY ENFORCEMENT
+--
+-- Corrections and patterns: fully immutable.
+-- Ratified rules: one permitted update — setting valid_until
+-- to supersede a rule. All other columns are frozen.
 -- ============================================================
 
 CREATE TRIGGER corrections_no_mutate
   BEFORE UPDATE OR DELETE ON cvcs.corrections
   FOR EACH ROW EXECUTE FUNCTION cvcs.prevent_update_delete();
 
--- ============================================================
--- PATTERN DETECTION HELPER
---
--- Surfaces recurring correction patterns in a repository.
--- The highest-count pattern_keys are where the cognitive state
--- most needs to evolve. Feed into the merge/commit workflow
--- to close the loop.
--- ============================================================
+CREATE TRIGGER patterns_no_mutate
+  BEFORE UPDATE OR DELETE ON cvcs.correction_patterns
+  FOR EACH ROW EXECUTE FUNCTION cvcs.prevent_update_delete();
 
-CREATE OR REPLACE FUNCTION cvcs.correction_patterns(
-  p_repository_id uuid,
-  p_since         timestamptz DEFAULT now() - interval '30 days',
-  p_min_count     integer     DEFAULT 3
-)
-RETURNS TABLE (
-  pattern_key          text,
-  correction_count     bigint,
-  unclosed_count       bigint,
-  first_seen           timestamptz,
-  last_seen            timestamptz,
-  affected_decisions   bigint,
-  example_decision_id  uuid,
-  example_reason       text
-)
-LANGUAGE sql STABLE AS $$
-  SELECT
-    pattern_key,
-    count(*)                                          AS correction_count,
-    count(*) FILTER (WHERE produced_commit_id IS NULL) AS unclosed_count,
-    min(corrected_at)                                 AS first_seen,
-    max(corrected_at)                                 AS last_seen,
-    count(DISTINCT decision_id)                       AS affected_decisions,
-    (array_agg(decision_id ORDER BY corrected_at DESC))[1] AS example_decision_id,
-    (array_agg(reason     ORDER BY corrected_at DESC))[1] AS example_reason
-  FROM cvcs.corrections
-  WHERE repository_id = p_repository_id
-    AND corrected_at >= p_since
-    AND pattern_key IS NOT NULL
-  GROUP BY pattern_key
-  HAVING count(*) >= p_min_count
-  ORDER BY correction_count DESC
+CREATE OR REPLACE FUNCTION cvcs.ratified_rules_allow_supersede()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF OLD.valid_until IS NOT NULL THEN
+    RAISE EXCEPTION 'ratified_rules: rule % is already superseded and cannot be modified', OLD.id;
+  END IF;
+  IF NEW.valid_until IS NULL THEN
+    RAISE EXCEPTION 'ratified_rules: the only permitted update is setting valid_until to supersede a rule';
+  END IF;
+  IF (NEW.rule_text, NEW.decision_type, NEW.ratified_by, NEW.ratified_at, NEW.valid_from, NEW.pattern_id, NEW.repository_id)
+     IS DISTINCT FROM
+     (OLD.rule_text, OLD.decision_type, OLD.ratified_by, OLD.ratified_at, OLD.valid_from, OLD.pattern_id, OLD.repository_id)
+  THEN
+    RAISE EXCEPTION 'ratified_rules: only valid_until and superseded_by may change when superseding a rule';
+  END IF;
+  RETURN NEW;
+END;
 $$;
 
-COMMENT ON FUNCTION cvcs.correction_patterns IS
-  'Surfaces recurring correction patterns. High unclosed_count means the cognitive state has not evolved to address a known failure. Feed into the commit workflow.';
+CREATE TRIGGER ratified_rules_supersede_only
+  BEFORE UPDATE ON cvcs.ratified_rules
+  FOR EACH ROW EXECUTE FUNCTION cvcs.ratified_rules_allow_supersede();
+
+CREATE TRIGGER ratified_rules_no_delete
+  BEFORE DELETE ON cvcs.ratified_rules
+  FOR EACH ROW EXECUTE FUNCTION cvcs.prevent_update_delete();
+
 
 -- ============================================================
--- CORRECTION RATE HELPER
---
--- Override rate per decision_type over time.
--- Correction rate climbing = cognitive drift or policy mismatch.
--- Correction rate falling after a commit = the commit worked.
+-- HELPERS
 -- ============================================================
 
-CREATE OR REPLACE FUNCTION cvcs.correction_rate(
-  p_repository_id uuid,
-  p_since         timestamptz DEFAULT now() - interval '30 days'
-)
+-- All corrections for a decision, with commit context.
+-- Used by the pattern detection job and review UI.
+CREATE OR REPLACE FUNCTION cvcs.corrections_for_decision(p_decision_id uuid)
 RETURNS TABLE (
+  correction_id     uuid,
+  corrected_by      text,
+  correction_scope  text,
+  original_output   text,
+  corrected_output  text,
+  reason            text,
+  corrected_at      timestamptz,
+  commit_hash       text,
+  decision_type     text
+) LANGUAGE sql STABLE AS $$
+  SELECT
+    c.id,
+    c.corrected_by,
+    c.correction_scope,
+    c.original_output,
+    c.corrected_output,
+    c.reason,
+    c.corrected_at,
+    cm.hash,
+    d.decision_type
+  FROM cvcs.corrections  c
+  JOIN cvcs.decisions    d  ON d.id = c.decision_id
+  JOIN cvcs.commits      cm ON cm.id = d.commit_id
+  WHERE c.decision_id = p_decision_id
+  ORDER BY c.corrected_at DESC
+$$;
+
+
+-- Patterns awaiting human review or ratification.
+-- Primary input for the learning loop review workflow.
+CREATE OR REPLACE FUNCTION cvcs.open_patterns(p_repository_id uuid)
+RETURNS TABLE (
+  pattern_id        uuid,
   decision_type     text,
-  total_decisions   bigint,
-  total_corrections bigint,
-  correction_rate   numeric,
-  last_corrected_at timestamptz
-)
-LANGUAGE sql STABLE AS $$
+  pattern_summary   text,
+  inferred_rule     text,
+  correction_count  integer,
+  first_seen_at     timestamptz,
+  last_seen_at      timestamptz
+) LANGUAGE sql STABLE AS $$
   SELECT
-    d.decision_type,
-    count(DISTINCT d.id)                                  AS total_decisions,
-    count(DISTINCT c.id)                                  AS total_corrections,
-    round(
-      count(DISTINCT c.id)::numeric / nullif(count(DISTINCT d.id), 0) * 100,
-      2
-    )                                                     AS correction_rate,
-    max(c.corrected_at)                                   AS last_corrected_at
-  FROM cvcs.decisions d
-  LEFT JOIN cvcs.corrections c ON c.decision_id = d.id
-  WHERE d.repository_id = p_repository_id
-    AND d.decided_at >= p_since
-  GROUP BY d.decision_type
-  ORDER BY correction_rate DESC NULLS LAST
+    id,
+    decision_type,
+    pattern_summary,
+    inferred_rule,
+    correction_count,
+    first_seen_at,
+    last_seen_at
+  FROM cvcs.correction_patterns
+  WHERE repository_id = p_repository_id
+    AND status IN ('detected', 'reviewed')
+  ORDER BY last_seen_at DESC
 $$;
 
-COMMENT ON FUNCTION cvcs.correction_rate IS
-  'Override rate per decision type. Rising rate after a commit = regression. Falling rate = the commit addressed the pattern.';
+
+-- Currently active ratified rules for a repository and decision type.
+-- Called at runtime to include ratified organizational learning in model context.
+CREATE OR REPLACE FUNCTION cvcs.active_rules(
+  p_repository_id uuid,
+  p_decision_type text DEFAULT NULL
+)
+RETURNS TABLE (
+  rule_id       uuid,
+  rule_text     text,
+  decision_type text,
+  blob_hash     text,
+  valid_from    timestamptz
+) LANGUAGE sql STABLE AS $$
+  SELECT
+    id,
+    rule_text,
+    decision_type,
+    blob_hash,
+    valid_from
+  FROM cvcs.ratified_rules
+  WHERE repository_id = p_repository_id
+    AND valid_until IS NULL
+    AND (p_decision_type IS NULL OR decision_type = p_decision_type)
+  ORDER BY valid_from DESC
+$$;
