@@ -25,6 +25,7 @@ CREATE TABLE cvcs.decisions (
 
   model_id        text             NOT NULL,
   model_version   text,
+  manifest_hash   text             NOT NULL,
 
   prompt_path     text             NOT NULL,
 
@@ -72,10 +73,13 @@ CREATE TABLE cvcs.replays (
 
   replay_commit_id      uuid        NOT NULL REFERENCES cvcs.commits(id),
   replay_model_id       text        NOT NULL,
+  replay_manifest_hash  text        NOT NULL,
 
   raw_output            text        NOT NULL,
   output_matches        boolean     NOT NULL,
   divergence_summary    text,
+  context_diff          jsonb       NOT NULL DEFAULT '[]',
+  output_diff           jsonb       NOT NULL DEFAULT '[]',
 
   latency_ms            integer,
   token_count           integer,
@@ -83,11 +87,17 @@ CREATE TABLE cvcs.replays (
   replayed_at           timestamptz NOT NULL DEFAULT now(),
 
   CHECK (length(replay_model_id) > 0),
+  CHECK (jsonb_typeof(context_diff) = 'array'),
+  CHECK (jsonb_typeof(output_diff) = 'array'),
   CHECK (latency_ms IS NULL OR latency_ms >= 0),
   CHECK (token_count IS NULL OR token_count > 0),
   CHECK (
     (output_matches = false AND divergence_summary IS NOT NULL)
     OR output_matches = true
+  ),
+  CHECK (
+    (output_matches = true AND jsonb_array_length(output_diff) = 0)
+    OR output_matches = false
   )
 );
 
@@ -121,6 +131,7 @@ RETURNS TABLE (
   decision_id     uuid,
   commit_hash     text,
   model_id        text,
+  manifest_hash   text,
   prompt_path     text,
   prompt_content  jsonb,
   raw_input       text,
@@ -131,6 +142,7 @@ RETURNS TABLE (
     d.id,
     c.hash,
     d.model_id,
+    d.manifest_hash,
     d.prompt_path,
     b.content,
     d.raw_input,

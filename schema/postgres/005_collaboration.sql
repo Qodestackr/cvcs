@@ -412,8 +412,13 @@ RETURNS TABLE (
   FROM cvcs.branches b
   LEFT JOIN cvcs.commits        hc ON hc.id = b.head_commit_id
   LEFT JOIN cvcs.branches       fb ON fb.id = b.forked_from_id
+  -- A decision is bound to a commit, not to a mutable branch pointer. Attribute it
+  -- to a branch only when that commit is present in the branch's ancestry.
   LEFT JOIN cvcs.decisions       d ON d.repository_id = p_repository_id
-                                   AND d.branch_id = b.id
+                                   AND EXISTS (
+                                     SELECT 1 FROM cvcs.branch_history(b.id) bh
+                                     WHERE bh.commit_id = d.commit_id
+                                   )
   LEFT JOIN cvcs.corrections    co ON co.decision_id = d.id
   LEFT JOIN cvcs.merge_requests mr ON mr.repository_id = p_repository_id
                                    AND (mr.source_branch_id = b.id

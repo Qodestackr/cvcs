@@ -1,133 +1,208 @@
 # CVCS
 
-**Cognitive Version Control System**
+**Version control for AI cognition and context.**
 
-Every AI system today produces decisions. Yet nobody treats those decisions as versioned artifacts that you can own, branch, replay, and merge. The context that shaped each decision, including the prompt, the active policy, the available knowledge, and the model that ran, disappears the moment the request ends.
+AI systems accumulate identity outside their model weights: prompts, policies, tool
+contracts, corrections, exceptions, and the decisions that made those things necessary.
+Today that history is scattered across application databases, tracing vendors, prompt
+dashboards, and people's heads. Change the model or orchestration framework and much of
+the system's learned behavior disappears.
 
-This is not an observability problem. Observability tools log what happened. CVCS versions why it happened, making it possible to replay it, diff it, branch from it, and own it, independent of which vendor's model is currently running.
+CVCS makes that history an owned, portable artifact.
 
-The distinction matters:
-
-```
-Observability   ->  "what did it do?"
-CVCS            ->  "what did it know, and can I reproduce that exact cognition later?"
-```
-
----
-
-## The Formalism
-
-```
-Identity = Log × Interpreter
+```text
+agent identity = cognitive log x interpreter
 ```
 
-An AI agent's identity does not live in its model weights. The model is rented. What you own is the accumulated history: every decision, correction, and context change that shapes how the system behaves in your domain. That history is the asset.
+The interpreter is the model and agent loop. It is replaceable. The cognitive log is the
+accumulated organizational knowledge that should survive every runtime change.
 
-This has one practical consequence that is easy to miss:
+## The loop
 
-> If your agent breaks when you swap GPT-4 for Claude, you built it wrong. All identity work that cannot live in the weights must live in the log. The log is the only artifact you fully own.
-
-The model is a runtime. The log is the system.
-
-```
-Same log + new model    = upgrade, not replacement
-Same log + new branch   = safe experiment
-Same log + replay       = full audit, years later
-Two logs + merge        = organizations sharing what they learned
+```text
+context commit -> decision -> correction -> reviewed rule -> context commit
+       ^                                                       |
+       +-------------------------------------------------------+
 ```
 
----
+A human override is not merely an error metric. It is evidence that an undocumented rule,
+exception, or preference exists. CVCS preserves that evidence against the exact cognitive
+state and runtime that produced the original decision. Repeated corrections can then be
+proposed as rules, reviewed, and committed back into future context.
 
-## What This Solves
+CVCS is therefore more than prompt versioning and more than observability:
 
-Modern AI deployments have no durable memory of themselves:
-
-- Which prompt produced this decision last Tuesday?
-- Did behavior change because we updated the policy, or because the model changed?
-- Can I replay this exact decision against the new model to measure the drift?
-- The insurance team learned something. Can the underwriting team inherit that learning without starting over?
-- If we leave OpenAI tomorrow, do we lose three years of behavioral history?
-
-CVCS answers all of these by treating every cognitive state as a commit, every decision as a ledger entry, and every correction as a first-class learning event.
-
----
-
-## What Corrections Actually Are
-
-When a human overrides an AI decision:
-
-```
-AI  -> output A
-Human -> output B
+```text
+observability: what did the runtime do?
+CVCS:          what did it know, what corrected it, and how did that change what came next?
 ```
 
-That is not noise. It is institutional knowledge surfacing. Every recurring correction exposes a rule that existed long before anyone bothered to document it. The richest source of organizational knowledge is not your documentation. It is the pattern of repeated corrections.
+## Try the executable kernel
 
-CVCS captures every correction as an immutable event linked to the exact decision it replaced. Over time, those events become the organization's real memory. Not the process it claimed to follow, but the one it actually did.
-
----
-
-## What It Does
-
-1. **Commits.** Every change to cognitive context, including prompts, policies, knowledge, and workflows, creates an immutable, content-addressed commit. Nothing is overwritten. History is append-only.
-
-2. **Branches.** Create isolated cognitive timelines. Experiment freely without affecting production. Compare outcomes before merging.
-
-3. **Replay.** Re-execute any historical decision against any commit or interpreter(model). See what changed and why.
-
-4. **Diff.** Compare any two cognitive states. Surface changes in prompts, policies, knowledge, behavior, and outcomes in plain language.
-
-5. **Merge.** Combine changes from independent branches into a single history. Organizational knowledge evolves only through explicit approval.
-
-6. **Rollback.** Move the branch pointer to any previous commit. The history remains intact. Only the active state changes.
-
-
----
-
-## What Users Actually Do
+CVCS currently ships a local-first Python kernel. It requires Python 3.12+ and
+[`uv`](https://docs.astral.sh/uv/).
 
 ```bash
-cvcs commit --message "tightened credit approval policy"
-cvcs branch experiment/looser-sku-matching
-cvcs replay decision abc123 --commit HEAD --model claude-sonnet-4-6
-cvcs diff main..experiment/looser-sku-matching
-cvcs merge experiment/looser-sku-matching --require-approval
-cvcs rollback commit def456
+uv sync
+uv run cvcs init demo --name claims-agent
+cd demo
+
+uv run cvcs commit prompts/system \
+  "You triage insurance claims." \
+  --type prompt \
+  --message "establish agent role"
+
+uv run cvcs commit policies/high-value \
+  '{"review_above": 10000}' \
+  --type policy \
+  --message "require human review for high-value claims"
+
+uv run cvcs decision claim_triage \
+  --input '{"amount": 15000}' \
+  --output '{"route": "automatic"}' \
+  --model example/model-v1
+
+uv run cvcs correct <decision-id> \
+  --output '{"route": "human_review"}' \
+  --scope policy \
+  --reason "High-value claims require review"
+
+uv run cvcs queue
+uv run cvcs log
+uv run cvcs verify
+
+# Move the complete cognitive history to another machine or runtime
+uv run cvcs export claims-agent.cvcs.jsonl
+uv run cvcs import claims-agent.cvcs.jsonl ../restored-claims-agent
 ```
 
----
+Run the correction-to-replay demonstration:
 
-## Architecture
-
-![Architecture0](./media/architecture0.png)
-Postgres is the ledger. The model is a runtime detail.
-
----
-
-## Schema Files
-
-```
-schema/
-  01_repositories.sql   - namespace, tenant isolation, bootstrap
-  02_content_store.sql  - blobs, commits, trees (the git object model)
-  03_execution.sql      - decisions, replays (runtime events, immutable)
-  04_corrections.sql    - human overrides, the learning signal
-  05_collaboration.sql  - branches, merge requests, approval flow
+```bash
+uv run python examples/claims_demo.py
 ```
 
-## MVP Stack
+It records a real claims-routing decision under a stale `25000` review policy, captures a
+supervisor correction, creates an inactive evidence-backed rule proposal, ratifies the
+`10000` policy on a learning branch, and replays the exact historical input. The result
+contains both the changed cognitive paths and the structural output differences.
 
-- **Storage:** Postgres. No adapters. No multi-database abstraction for MVP. The ledger semantics (append-only triggers, content-addressed hashing, referential integrity) are Postgres-native and that is not incidental.
-- **Backend:** Go. The runtime engine that loads commits, hydrates context, calls models, and writes to the ledger.
-- **Frontend:** TypeScript. The UI surface: diff viewer, replay inspector, branch graph.
-- **Models:** Any HTTP API. The runtime engine holds a thin interface. Swap the implementation, not the architecture.
+Any executable can act as an interpreter. It receives a JSON object containing
+`decision_type`, `input`, and the resolved cognitive `manifest` on stdin, and returns one
+JSON value on stdout:
 
----
+```bash
+uv run cvcs run claim_routing \
+  --input '{"claim_id":"CLM-1042","amount":15000}' \
+  --model internal/claims-v1 \
+  --command python examples/claims_runtime.py
 
-## What This Is Not
+uv run cvcs replay <decision-id> \
+  --commit learning/lower-review-threshold \
+  --model internal/claims-v1 \
+  --command python examples/claims_runtime.py
+```
 
-Not a prompt management tool. Not an observability dashboard. Not a RAG pipeline. Not an eval harness.
+`--model` is recorded identity, not a provider integration requirement. The command can
+wrap an HTTP model API, an agent framework, a local model, or deterministic business code.
 
-Those tools answer "what happened?" CVCS answers "what did the system *know* when it decided and can I own, reproduce, and evolve that knowledge independently of my vendors?"
+Set `CVCS_ACTOR` to put a stable human or service identity on every event. `--actor` takes
+precedence for a single command.
 
-This is version control for how organizations think and decide over time.
+## Commands
+
+| Command | Purpose |
+| --- | --- |
+| `cvcs init` | Create `.cvcs/ledger.db` and the genesis event |
+| `cvcs commit` | Put a prompt, policy, tool, workflow, or knowledge value at a logical path |
+| `cvcs remove` | Remove a path through a new immutable commit |
+| `cvcs branch` / `checkout` | Fork and select cognitive timelines |
+| `cvcs decision` | Bind a runtime decision to the exact active commit |
+| `cvcs correct` | Preserve a human override as a first-class learning event |
+| `cvcs queue` | Show correction evidence waiting to be turned into context |
+| `cvcs propose-rule` | Turn one or more corrections into an inactive rule proposal |
+| `cvcs learning` | Show proposals waiting for human ratification |
+| `cvcs ratify-rule` | Approve a proposal and generate its context commit |
+| `cvcs diff` / `show` / `log` | Inspect state, objects, and causal history |
+| `cvcs resolve` | Hydrate a commit into a provider-neutral runtime manifest |
+| `cvcs run` | Execute an external interpreter and record its decision at that manifest |
+| `cvcs replay` | Re-run an actual historical input against another commit or interpreter |
+| `cvcs export` / `import` | Move a canonical, vendor-neutral cognitive history |
+| `cvcs rebuild` | Reconstruct query projections deterministically from the event log |
+| `cvcs verify` | Recompute every event and object hash |
+
+## Storage model
+
+The repository is a small, portable directory:
+
+```text
+.cvcs/
+  ledger.db
+```
+
+The SQLite ledger contains:
+
+- an append-only, SHA-256-chained cognitive event stream;
+- content-addressed blobs and commits;
+- branch pointers;
+- query projections for decisions, corrections, proposals, ratifications, and replays.
+
+The event stream is the source of truth. Projections exist to make the history useful.
+Read [the architecture note](docs/architecture.md) for the boundary between the ledger,
+the cognition graph, and replaceable runtimes.
+
+### Portable bundle format
+
+`cvcs export` emits canonical JSON Lines. The first record identifies the format and
+repository, followed by content-addressed objects and the ordered event chain. Mutable
+SQLite projections are intentionally excluded. During import, CVCS validates every object
+hash and every link in the event chain before rebuilding branch refs, decisions, and
+corrections.
+
+This makes the bundle an interoperability boundary rather than a database backup. Another
+implementation can consume it without reproducing CVCS's SQLite layout.
+
+The ordered Postgres modules under [`schema/postgres/`](schema/postgres/) define the
+collaborative/server model.
+It covers repositories, content, executions, corrections, ratified rules, branches, and
+merge review. The local kernel lets the semantics mature through use before a networked
+control plane freezes them.
+
+## Principles
+
+- **The model is a runtime.** Provider SDK objects never define stored identity.
+- **Corrections are knowledge evidence.** They remain linked to the decision and context
+  they corrected.
+- **Learning is governed.** Detected patterns become active rules only through explicit
+  review and a new commit.
+- **History is append-only.** State changes by adding facts and moving refs, not rewriting
+  evidence.
+- **Portability is architectural.** Canonical JSON and content hashes are stable across
+  languages, databases, and vendors.
+
+## Why this is not an eval platform
+
+An eval starts with a dataset and asks how a model scores. CVCS starts with an actual
+decision and asks which owned cognitive state produced it, what a human corrected, which
+governed change followed, and whether replaying that same input changes the outcome.
+
+Evals can consume CVCS history, but they are downstream. CVCS owns the causal record that
+explains *why* behavior changed across prompts, policies, tools, knowledge, workflows, and
+interpreters.
+
+## Maturity
+
+CVCS is an alpha kernel that proves the complete cognitive learning loop. It is not yet a
+secure multi-tenant control plane. The missing security, distributed-systems, governance,
+and operational work is explicit in [production readiness](docs/production-readiness.md),
+with a ready-to-publish [GitHub issue draft](docs/issues/001-production-control-plane.md).
+
+## Development
+
+```bash
+uv sync --dev
+uv run pytest
+uv run ruff check .
+```
+
+Open source under the MIT License.
