@@ -194,8 +194,7 @@ interpreters.
 
 CVCS is an alpha kernel that proves the complete cognitive learning loop. It is not yet a
 secure multi-tenant control plane. The missing security, distributed-systems, governance,
-and operational work is explicit in [production readiness](docs/production-readiness.md),
-with a ready-to-publish [GitHub issue draft](docs/issues/001-production-control-plane.md).
+and operational work is explicit as WIP
 
 ## Development
 
